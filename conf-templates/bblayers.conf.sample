@@ -1,0 +1,18 @@
+# POKY_BBLAYERS_CONF_VERSION is increased each time build/conf/bblayers.conf
+# changes incompatibly
+POKY_BBLAYERS_CONF_VERSION = "2"
+
+BBPATH = "${TOPDIR}"
+BBFILES ?= ""
+
+BBLAYERS ?= " \
+  /home/t/aurascope-yocto/poky/meta \
+  /home/t/aurascope-yocto/poky/meta-poky \
+  /home/t/aurascope-yocto/poky/meta-yocto-bsp \
+  /home/t/aurascope-yocto/meta-openembedded/meta-oe \
+  /home/t/aurascope-yocto/aurascope/meta-aurascope \
+  /home/t/aurascope-yocto/meta-arm/meta-arm-toolchain \
+  /home/t/aurascope-yocto/meta-arm/meta-arm \
+  /home/t/aurascope-yocto/meta-xilinx/meta-xilinx-core \
+  /home/t/aurascope-yocto/meta-xilinx/meta-xilinx-bsp \
+  "
