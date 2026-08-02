@@ -1,0 +1,24 @@
+/dts-v1/;
+#include "zynq-7000.dtsi"
+
+/ {
+	model = "AuraScope Arty Z7-20";
+	compatible = "digilent,zynq-artyz7", "xlnx,zynq-7000";
+
+	/* Arty Z7-20: 1 GiB DDR3L. PS-only for first boot; PL/bitstream
+	 * peripherals (AXI GPIO) are added once the bitstream is wired
+	 * back in for the LED phase. */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x40000000>;
+	};
+
+	chosen {
+		bootargs = "console=ttyPS0,115200 root=/dev/mmcblk0p2 rw rootwait";
+		stdout-path = "serial0:115200n8";
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
