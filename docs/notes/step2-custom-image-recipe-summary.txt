@@ -1,0 +1,251 @@
+AuraScope — Step 2: Custom image and recipe
+Draft working notes for the blog write-up. Not yet committed to the repo.
+
+GOAL
+----
+Get `bitbake aurascope-image` building for the real board (MACHINE =
+aurascope-arty-z7), not just qemux86-64. Starting point: meta-aurascope had
+only the layer skeleton (conf/layer.conf) — no recipes at all, and MACHINE
+was still defaulting to qemux86-64 in local.conf.
+
+
+1. THE IMAGE RECIPE
+--------------------
+Added meta-aurascope/recipes-core/images/aurascope-image.bb, modeled
+directly on poky's core-image-minimal.bb:
+
+    SUMMARY = "AuraScope base image for the Arty Z7-20 (Zynq-7000)"
+    LICENSE = "MIT"
+    inherit core-image
+    IMAGE_INSTALL = "packagegroup-core-boot ${CORE_IMAGE_EXTRA_INSTALL}"
+    IMAGE_ROOTFS_SIZE ?= "8192"
+    IMAGE_ROOTFS_EXTRA_SPACE:append = "..."
+
+Set MACHINE = "aurascope-arty-z7" in build/conf/local.conf (was
+qemux86-64). This alone was enough to build for QEMU; building for the
+real board is where things got interesting.
+
+
+2. BUG: XILINX_WITH_ESW ORDERING IN THE GENERATED MACHINE CONF
+----------------------------------------------------------------
+First real-board parse failed: virtual/dtb, fsbl, virtual/bitstream all had
+"Nothing PROVIDES". Root cause turned out to be in the generated
+build/conf/machine/aurascope-arty-z7.conf itself:
+
+    # Required generic machine inclusion
+    require conf/machine/zynq-generic.conf     <- was BEFORE this
+
+    # This is an 'XSCT' based BSP
+    XILINX_WITH_ESW = "xsct"                   <- ...this
+
+zynq-generic.conf's own comment says hw-specific variables must be set
+BEFORE its `require`, because several PREFERRED_PROVIDER defaults in
+meta-xilinx-core/conf/machine/include/machine-xilinx-default.inc key off
+XILINX_WITH_ESW at parse time:
+
+    PREFERRED_PROVIDER_virtual/dtb ??= "${@'device-tree' if d.getVar('XILINX_WITH_ESW') else ''}"
+
+Confirmed this is an actual upstream bug by reading gen-machineconf's own
+source (meta-xilinx-core/gen-machine-conf/lib/yocto_machine.py,
+YoctoXsctConfigs()) — its own comment states the same ordering requirement,
+then the function emits `require` before `XILINX_WITH_ESW = "xsct"`
+anyway. So this reappears every time gen-machineconf regenerates the file;
+had to be fixed again after re-running it. Fix: move the XILINX_WITH_ESW
+line above the `require conf/machine/zynq-generic.conf` line.
+
+Re-ran gen-machineconf once meta-aurascope had a recipes-* directory (the
+earlier run had warned "No bb files in default matched
+BBFILE_PATTERN_meta-aurascope" — that's why it never dropped anything
+useful into meta-aurascope the first time):
+
+    ./meta-xilinx/meta-xilinx-core/gen-machine-conf/gen-machineconf \
+      --soc-family zynq \
+      --hw-description aurascope/hw/design_2_wrapper.xsa \
+      --machine-name aurascope-arty-z7 \
+      --xsct-tool /opt/2025.2/Vitis
+
+
+3. DEVICE TREE
+--------------
+device-tree.bb (meta-xilinx-core) self-skips unless CONFIG_DTFILE or
+SYSTEM_DTFILE is set:
+
+    def check_devicetree_variables(d):
+        if not d.getVar('CONFIG_DTFILE'):
+            raise bb.parse.SkipRecipe(...)
+
+Nothing in the "xsct" flow (used for Zynq-7000; System Device Tree /
+lopper-based generation is ZynqMP+/Versal only) ever sets this — the
+YAML_CONSOLE_DEVICE_CONFIG / YAML_MAIN_MEMORY_CONFIG variables that
+gen-machineconf writes into the machine conf for "xsct" mode are, as far
+as I can tell, dead in this meta-xilinx release: grepped the whole
+meta-xilinx tree and nothing outside gen-machineconf itself reads them.
+
+Rather than hand-write a full zynq-7000 SoC-level device tree from
+scratch (real risk of subtly wrong clock/interrupt indices, hard to debug
+without hardware in hand), added:
+
+  meta-aurascope/recipes-bsp/device-tree/device-tree.bbappend
+  meta-aurascope/recipes-bsp/device-tree/files/system-top.dts
+
+The bbappend re-enables devicetree.bbclass's normal KERNEL_INCLUDE default
+(device-tree.bb blanks it out by default: "Since we're not based on a
+kernel default to nothing"), so system-top.dts can `#include
+"zynq-7000.dtsi"` and get the real, maintained dtsi shipped by linux-xlnx
+instead of a hand-copied one. This also auto-adds a do_compile dependency
+on virtual/kernel:do_configure so the kernel source is staged first.
+
+system-top.dts itself is intentionally minimal for now: memory node sized
+for the Arty Z7-20's 1 GiB DDR3L, chosen/stdout-path set to ttyPS0, uart0
+forced on. No PL/AXI-GPIO nodes yet — see bitstream section below.
+
+  NOTE: I assumed the dtsi filename "zynq-7000.dtsi" matches what
+  linux-xlnx ships (that's the mainline/mostly-universal name across
+  Xilinx forks). Worth double-checking on the actual build — if it's
+  named differently in this specific linux-xlnx branch, it'll be an
+  immediate, obvious #include-not-found error, one-line fix.
+
+
+4. BITSTREAM — DEFERRED, NOT SOLVED
+-------------------------------------
+xilinx-bootbin (builds BOOT.bin) pulls in virtual/bitstream by default via
+BIF_BITSTREAM_ATTR, which defaults to "bitstream" unless MACHINE_FEATURES
+contains "fpga-overlay". Rather than sourcing an actual .bit file (would
+need Vivado to build/export one separately from the .xsa, or the .xsa to
+embed it), set:
+
+    BIF_BITSTREAM_ATTR = ""
+
+in build/conf/local.conf. This means BOOT.bin ships FSBL + u-boot +
+device-tree but does NOT configure the PL — Linux still boots fine (PS and
+PL are independent on Zynq-7000), but AXI GPIO / anything in the fabric
+won't be accessible until the bitstream is loaded, either at boot (revisit
+this) or later via fpga-manager. This is fine for "first boot" but WILL
+need revisiting for the audio-status LED step, since that's AXI GPIO in
+the PL.
+
+
+5. FSBL — THE HARD PART
+-------------------------
+fsbl.bb (meta-xilinx-core) also self-skips unless it's handed a
+precompiled fsbl.elf via FSBL_FILE, or FSBL_DEPENDS/FSBL_MCDEPENDS point at
+something that builds one. Three things tried, in order:
+
+  a) meta-xilinx-standalone's "fsbl-fw" multiconfig
+     (conf/multiconfig/fsbl-fw.conf + recipes-bsp/embeddedsw/fsbl-fw-cfg.inc
+     exist as a ready-made template: BBMULTICONFIG += "fsbl-fw", separate
+     TMPDIR, DISTRO=xilinx-standalone with a real arm-xilinx-eabi
+     toolchain). Wired it up, multiconfig parsed fine (mc:fsbl-fw context
+     showed TARGET_SYS=arm-xilinx-eabi, DISTRO=xilinx-standalone, correct)
+     but task graph failed:
+
+       ERROR: Task mcdepends on non-existent task
+       mc:fsbl-fw:.../fsbl-firmware_2025.2.bb:do_deploy
+
+     Confirmed by reading fsbl-firmware.inc + xlnx-embeddedsw.bbclass in
+     full: in "xsct" ESW mode, this recipe only fetches the Xilinx
+     embeddedsw git source. It has no do_compile/do_install/do_deploy at
+     all — genuinely does nothing beyond the source fetch. Verified with
+     `bitbake -c deploy mc:fsbl-fw:fsbl-firmware` -> "Task do_deploy does
+     not exist for target fsbl-firmware". Dead end for "xsct" mode.
+
+  b) Switched XILINX_WITH_ESW from "xsct" to "generic" — this mode's
+     fsbl-firmware_generic.inc DOES have real do_install/do_deploy tasks
+     (compiles zynq_fsbl from embeddedsw source via a Makefile + the
+     multiconfig's cross-compiler). Looked promising, but every version of
+     fsbl-firmware_*+git-generic.inc has:
+
+       SKIP_MSG:zynq = "Generic support for zynq is not available"
+
+     i.e. deliberately, permanently disabled for Zynq-7000 upstream (looks
+     like "generic" mode is only actually supported for zynqmp/versal in
+     this meta-xilinx release). Reverted XILINX_WITH_ESW back to "xsct".
+
+  c) Built fsbl.elf directly with Vitis instead of via bitbake. Vitis
+     2025.2 is the "unified" IDE; found a working example at
+     /opt/2025.2/Vitis/cli/examples/embedded/platform_uc4_zynq.py and
+     adapted it — headless, `vitis -s script.py`:
+
+       client = vitis.create_client()
+       client.set_workspace(workspace)
+       platform = client.create_platform_component(
+           name='aurascope_platform',
+           hw_design='/path/to/aurascope/hw/design_2_wrapper.xsa')
+       platform.add_domain(name='standalone_a9_0',
+                            cpu='ps7_cortexa9_0', os='standalone')
+       platform.build()
+
+     This actually compiled a real fsbl.elf (91345 text / 10904 data /
+     76300 bss), using ps7_init.c generated fresh from the .xsa's hardware
+     description — good sanity check that the .xsa itself is valid and
+     complete. Output landed at
+     <workspace>/aurascope_platform/export/aurascope_platform/sw/boot/fsbl.elf.
+
+     Copied it into the repo:
+       meta-aurascope/recipes-bsp/embeddedsw/files/fsbl.elf
+     and added:
+       meta-aurascope/recipes-bsp/embeddedsw/fsbl.bbappend
+         FSBL_FILE := "${THISDIR}/files/fsbl"
+
+     First attempt used `=` instead of `:=` for that assignment — silently
+     wrong. THISDIR only resolves to the bbappend's own directory if
+     captured immediately (`:=`) at parse time; with a plain `=` it's
+     re-evaluated later when the anonymous python() check actually reads
+     FSBL_FILE, by which point THISDIR had reverted to fsbl.bb's own
+     directory (meta-xilinx-core/recipes-bsp/embeddedsw), not the
+     bbappend's. This is exactly why the standard
+     `FILESEXTRAPATHS:prepend := "${THISDIR}/files:"` idiom always uses
+     `:=` — good one to remember.
+
+     NOTE: there's also a competing fsbl.bbappend in meta-xilinx-standalone
+     itself (higher layer priority than meta-aurascope: 7 vs 6), which
+     redefines check_fsbl_variables() with a slightly different error
+     message but the same underlying logic — that's a red herring, not a
+     conflict; just makes the error text look like it's coming from a
+     different place than expected.
+
+
+6. RESULT
+---------
+`bitbake -n aurascope-image` (dry run) for MACHINE=aurascope-arty-z7:
+4637 tasks, 0 missing providers, everything projected to succeed —
+toolchain, kernel, u-boot, FSBL, device-tree, rootfs, BOOT.bin, WIC image.
+
+Have NOT yet run the real (non-dry-run) build, and have NOT yet flashed
+or booted actual hardware. That's the natural next checkpoint: run
+`bitbake aurascope-image` for real, then flash + serial console + confirm
+login prompt.
+
+
+FILES ADDED (committed: a33f057)
+---------------------------------
+meta-aurascope/recipes-core/images/aurascope-image.bb
+meta-aurascope/recipes-bsp/device-tree/device-tree.bbappend
+meta-aurascope/recipes-bsp/device-tree/files/system-top.dts
+meta-aurascope/recipes-bsp/embeddedsw/fsbl.bbappend
+meta-aurascope/recipes-bsp/embeddedsw/files/fsbl.elf   (built via Vitis, not bitbake)
+
+NOT in git (build/ isn't part of this repo, matches your existing
+conf-templates/ convention — regenerated locally, not committed):
+build/conf/local.conf
+    MACHINE = "aurascope-arty-z7"
+    BIF_BITSTREAM_ATTR = ""
+build/conf/machine/aurascope-arty-z7.conf
+    XILINX_WITH_ESW ordering fix (reapply if gen-machineconf reruns)
+
+Worth considering: checking a copy of the machine conf (with the ordering
+fix applied) into meta-aurascope/conf/machine/, and adding
+BIF_BITSTREAM_ATTR to conf-templates/local.conf.sample, so a fresh clone
+reproduces this without needing to rediscover the ordering bug.
+
+
+OPEN ITEMS FOR NEXT STEP
+--------------------------
+- Run the real build (not dry-run), time it, note any real-build-only
+  failures dry-run wouldn't catch (actual compiles, disk space, etc).
+- Flash BOOT.bin + rootfs, confirm serial console + login prompt.
+- Bitstream/PL is still not loaded — needed before the AXI GPIO
+  (audio-status LED) step.
+- Double-check the zynq-7000.dtsi include actually resolves against
+  whatever linux-xlnx branch gets pulled in (untested against a real
+  kernel fetch/unpack yet).
