@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "health.h"
 #include "http.h"
 
 #include <stdio.h>
@@ -27,6 +28,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "aurascope-dash: failed to start capture thread\n");
         return 1;
     }
+
+    if (health_monitor_start() != 0)
+        fprintf(stderr, "aurascope-dash: health monitor failed to start, continuing without it\n");
 
     return http_server_run(port, webroot) == 0 ? 0 : 1;
 }

@@ -1,5 +1,6 @@
 #include "http.h"
 #include "audio.h"
+#include "health.h"
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -70,6 +71,11 @@ static void serve_stream(int fd) {
         snap = g_snapshot;
         pthread_mutex_unlock(&g_snapshot_lock);
 
+        health_snapshot_t health;
+        pthread_mutex_lock(&g_health_lock);
+        health = g_health;
+        pthread_mutex_unlock(&g_health_lock);
+
         int len = snprintf(json, sizeof(json),
             "{\"t\":%ld,\"rms_db\":%.1f,\"peak_db\":%.1f,\"peak_hold_db\":%.1f,\"wave\":[",
             snap.ts_ms, snap.rms_db, snap.peak_db, snap.peak_hold_db);
@@ -84,7 +90,15 @@ static void serve_stream(int fd) {
             len += snprintf(json + len, sizeof(json) - (size_t)len, "%s%.1f",
                              i ? "," : "", snap.spec[i]);
 
-        len += snprintf(json + len, sizeof(json) - (size_t)len, "]}");
+        len += snprintf(json + len, sizeof(json) - (size_t)len,
+            "],\"health\":{\"ok\":%d,\"xrun_total\":%lu,\"xrun_last_ms\":%ld,\"period_hist\":[",
+            health.ply_ok, health.xrun_total, health.xrun_last_ms);
+
+        for (int i = 0; i < PERIOD_HIST_BUCKETS && len < (int)sizeof(json) - 64; i++)
+            len += snprintf(json + len, sizeof(json) - (size_t)len, "%s%lu",
+                             i ? "," : "", health.period_hist[i]);
+
+        len += snprintf(json + len, sizeof(json) - (size_t)len, "]}}");
 
         static char frame[8300];
         int flen = snprintf(frame, sizeof(frame), "data: %s\n\n", json);

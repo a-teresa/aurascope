@@ -1,8 +1,8 @@
 CC       ?= cc
 CFLAGS   ?= -O2 -Wall -Wextra
-LDLIBS   := -lasound -lpthread -lm
+LDLIBS   := -lasound -lpthread -lm -lutil
 
-SRCS := main.c audio.c http.c fft.c
+SRCS := main.c audio.c http.c fft.c health.c
 OBJS := $(SRCS:.c=.o)
 BIN  := aurascope-dash
 

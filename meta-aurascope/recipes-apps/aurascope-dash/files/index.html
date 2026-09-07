@@ -15,6 +15,12 @@
   .legend { display:flex; gap:16px; font-size:11px; color:#9aa7b6; margin:4px 0; }
   .legend span { display:inline-flex; align-items:center; gap:5px; }
   .swatch { width:9px; height:9px; border-radius:2px; display:inline-block; }
+  .health-wrap { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; margin-top:16px; }
+  .health-stats { display:flex; flex-direction:column; gap:6px; font-size:12px; color:#9aa7b6; min-width:180px; }
+  .health-stats .big { font-size:20px; font-weight:600; color:#dfe6ee; }
+  .dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px; }
+  .dot-ok { background:#59d69d; }
+  .dot-bad { background:#5c6773; }
 </style>
 </head>
 <body>
@@ -44,6 +50,19 @@
     <canvas id="history" width="1216" height="140"></canvas>
   </div>
 
+  <div class="health-wrap">
+    <div>
+      <div class="label">period-interval latency (kprobe: snd_pcm_period_elapsed)</div>
+      <canvas id="latency" width="600" height="140"></canvas>
+    </div>
+    <div class="health-stats">
+      <div class="label">observability (eBPF via ply)</div>
+      <div><span class="dot" id="healthDot"></span><span id="healthText">waiting for kprobe data&hellip;</span></div>
+      <div class="big" id="xrunCount">0 <span style="font-size:12px;font-weight:400;color:#9aa7b6">xruns</span></div>
+      <div id="xrunLast">no xrun observed yet</div>
+    </div>
+  </div>
+
   <div class="status" id="status">connecting&hellip;</div>
 
 <script>
@@ -51,12 +70,18 @@ const waveCanvas    = document.getElementById('wave');
 const specCanvas    = document.getElementById('spec');
 const meterCanvas   = document.getElementById('meter');
 const historyCanvas = document.getElementById('history');
+const latencyCanvas = document.getElementById('latency');
 const waveCtx    = waveCanvas.getContext('2d');
 const specCtx    = specCanvas.getContext('2d');
 const meterCtx   = meterCanvas.getContext('2d');
 const historyCtx = historyCanvas.getContext('2d');
+const latencyCtx = latencyCanvas.getContext('2d');
 const statusEl = document.getElementById('status');
 const dbText = document.getElementById('dbtext');
+const healthDot = document.getElementById('healthDot');
+const healthText = document.getElementById('healthText');
+const xrunCount = document.getElementById('xrunCount');
+const xrunLast = document.getElementById('xrunLast');
 
 const GRID_COLOR  = '#232833';
 const LABEL_COLOR = '#5c6773';
@@ -207,6 +232,52 @@ function pushHistory(rmsDb, peakDb) {
   if (peakHist.length > HISTORY_LEN) peakHist.shift();
 }
 
+/* --- eBPF (ply) health: period-interval histogram + xrun counter --- */
+const LATENCY_BUCKET_LABELS = [
+  '<1', '1-2', '2-4', '4-8', '8-16', '16-32',
+  '32-64', '64-128', '128-256', '256-512', '512-1k', '>1k',
+];
+
+function drawLatency(hist) {
+  const w = latencyCanvas.width, h = latencyCanvas.height;
+  latencyCtx.clearRect(0, 0, w, h);
+
+  const total = hist.reduce((a, b) => a + b, 0) || 1;
+  const peak = Math.max(...hist, 1);
+
+  latencyCtx.save();
+  latencyCtx.font = AXIS_FONT;
+  latencyCtx.textAlign = 'center';
+
+  const bw = w / hist.length;
+  hist.forEach((count, i) => {
+    const norm = count / peak;
+    const bh = norm * (h - 24);
+    const bright = count > 0 && i >= 6; /* >=32ms is unusually slow for a ~20ms period */
+    latencyCtx.fillStyle = bright ? '#ff8a5c' : '#7aa2ff';
+    latencyCtx.fillRect(i * bw + 2, h - 18 - bh, bw - 4, bh);
+    latencyCtx.fillStyle = LABEL_COLOR;
+    latencyCtx.fillText(LATENCY_BUCKET_LABELS[i], i * bw + bw / 2, h - 4);
+  });
+  latencyCtx.restore();
+
+  return total;
+}
+
+function drawHealth(health) {
+  const total = drawLatency(health.period_hist);
+
+  healthDot.className = 'dot ' + (health.ok ? 'dot-ok' : 'dot-bad');
+  healthText.textContent = health.ok
+    ? `tracing live (${total} period events)`
+    : 'no kprobe events yet — is ply running?';
+
+  xrunCount.innerHTML = `${health.xrun_total} <span style="font-size:12px;font-weight:400;color:#9aa7b6">xruns</span>`;
+  xrunLast.textContent = health.xrun_last_ms >= 0
+    ? `last xrun ${(health.xrun_last_ms / 1000).toFixed(1)}s into this run`
+    : 'no xrun observed yet';
+}
+
 const es = new EventSource('/stream');
 es.onopen = () => statusEl.textContent = 'connected';
 es.onerror = () => statusEl.textContent = 'disconnected — retrying…';
@@ -217,6 +288,7 @@ es.onmessage = (ev) => {
   drawMeter(d.rms_db, d.peak_db, d.peak_hold_db);
   pushHistory(d.rms_db, d.peak_db);
   drawHistory();
+  drawHealth(d.health);
 };
 </script>
 </body>

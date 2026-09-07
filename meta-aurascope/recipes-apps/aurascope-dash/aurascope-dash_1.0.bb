@@ -1,11 +1,13 @@
 SUMMARY = "AuraScope live audio dashboard (ALSA capture + SSE + Canvas UI)"
-DESCRIPTION = "Captures ALSA audio, computes RMS/peak/FFT, and serves a \
-Canvas + Server-Sent-Events dashboard over a hand-rolled HTTP server. \
-Phase 3 / M1 of the AuraScope observability plan."
+DESCRIPTION = "Captures ALSA audio, computes RMS/peak/FFT, traces the ALSA \
+period/xrun path via ply, and serves a Canvas + Server-Sent-Events dashboard \
+over a hand-rolled HTTP server. Phase 3 (M1 + M3) of the AuraScope \
+observability plan."
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
 DEPENDS = "alsa-lib"
+RDEPENDS:${PN} = "ply"
 
 inherit update-rc.d
 
@@ -20,6 +22,8 @@ SRC_URI = " \
     file://http.h \
     file://fft.c \
     file://fft.h \
+    file://health.c \
+    file://health.h \
     file://Makefile \
     file://index.html \
     file://aurascope-dash.init \
