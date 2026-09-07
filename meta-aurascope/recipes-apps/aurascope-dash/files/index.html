@@ -1,0 +1,223 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>AuraScope Dashboard</title>
+<style>
+  body { background:#0b0d10; color:#dfe6ee; font-family: system-ui, sans-serif; margin:0; padding:16px; }
+  h1 { font-size:16px; font-weight:600; color:#8fb3ff; margin:0 0 12px; }
+  .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
+  canvas { background:#12151a; border:1px solid #232833; border-radius:6px; display:block; }
+  .meter-wrap { display:flex; flex-direction:column; gap:4px; font-size:12px; color:#9aa7b6; }
+  .label { font-size:11px; color:#5c6773; margin:4px 0; }
+  .status { font-size:12px; color:#5c6773; margin-top:8px; }
+  .history-wrap { width:100%; max-width:1216px; overflow-x:auto; margin-top:16px; }
+  .legend { display:flex; gap:16px; font-size:11px; color:#9aa7b6; margin:4px 0; }
+  .legend span { display:inline-flex; align-items:center; gap:5px; }
+  .swatch { width:9px; height:9px; border-radius:2px; display:inline-block; }
+</style>
+</head>
+<body>
+  <h1>AuraScope &mdash; live scope</h1>
+  <div class="row">
+    <div>
+      <div class="label">waveform</div>
+      <canvas id="wave" width="600" height="160"></canvas>
+    </div>
+    <div>
+      <div class="label">spectrum</div>
+      <canvas id="spec" width="600" height="160"></canvas>
+    </div>
+    <div class="meter-wrap">
+      <div class="label">level</div>
+      <canvas id="meter" width="60" height="160"></canvas>
+      <div id="dbtext">-- dBFS</div>
+    </div>
+  </div>
+
+  <div class="history-wrap">
+    <div class="legend">
+      <span><span class="swatch" style="background:#59d69d"></span>RMS</span>
+      <span><span class="swatch" style="background:#ff5c5c"></span>Peak</span>
+      <span style="margin-left:auto">last 30s</span>
+    </div>
+    <canvas id="history" width="1216" height="140"></canvas>
+  </div>
+
+  <div class="status" id="status">connecting&hellip;</div>
+
+<script>
+const waveCanvas    = document.getElementById('wave');
+const specCanvas    = document.getElementById('spec');
+const meterCanvas   = document.getElementById('meter');
+const historyCanvas = document.getElementById('history');
+const waveCtx    = waveCanvas.getContext('2d');
+const specCtx    = specCanvas.getContext('2d');
+const meterCtx   = meterCanvas.getContext('2d');
+const historyCtx = historyCanvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const dbText = document.getElementById('dbtext');
+
+const GRID_COLOR  = '#232833';
+const LABEL_COLOR = '#5c6773';
+const AXIS_FONT   = '10px system-ui, sans-serif';
+
+/* Horizontal reference lines with dB (or amplitude) labels on the left edge. */
+function drawHGrid(ctx, w, h, stops, fmt) {
+  ctx.save();
+  ctx.font = AXIS_FONT;
+  ctx.textBaseline = 'middle';
+  stops.forEach(({ y, label, emphasis }) => {
+    ctx.strokeStyle = emphasis ? '#3a4252' : GRID_COLOR;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, y + 0.5);
+    ctx.lineTo(w, y + 0.5);
+    ctx.stroke();
+    if (label !== undefined) {
+      ctx.fillStyle = LABEL_COLOR;
+      ctx.fillText(fmt ? fmt(label) : label, 4, y - 6 < 8 ? y + 8 : y - 6);
+    }
+  });
+  ctx.restore();
+}
+
+function drawWave(samples) {
+  const w = waveCanvas.width, h = waveCanvas.height;
+  waveCtx.clearRect(0, 0, w, h);
+
+  drawHGrid(waveCtx, w, h, [
+    { y: 4,           label: '+1'  },
+    { y: h * 0.25,    label: '+.5' },
+    { y: h / 2,       label: '0',  emphasis: true },
+    { y: h * 0.75,    label: '-.5' },
+    { y: h - 4,       label: '-1'  },
+  ]);
+
+  waveCtx.strokeStyle = '#5eead4';
+  waveCtx.lineWidth = 2;
+  waveCtx.shadowColor = 'rgba(94,234,212,0.6)';
+  waveCtx.shadowBlur = 4;
+  waveCtx.beginPath();
+  samples.forEach((s, i) => {
+    const x = (i / (samples.length - 1)) * w;
+    const y = h / 2 - s * (h / 2 - 4);
+    i === 0 ? waveCtx.moveTo(x, y) : waveCtx.lineTo(x, y);
+  });
+  waveCtx.stroke();
+  waveCtx.shadowBlur = 0;
+}
+
+function drawSpec(bars) {
+  const w = specCanvas.width, h = specCanvas.height;
+  specCtx.clearRect(0, 0, w, h);
+
+  const floor = -90, ceil = 0;
+  const toY = db => h - Math.max(0, Math.min(1, (db - floor) / (ceil - floor))) * h;
+
+  drawHGrid(specCtx, w, h, [0, -20, -40, -60, -80].map(db => ({
+    y: toY(db), label: db, emphasis: db === 0,
+  })), db => `${db}`);
+
+  const grad = specCtx.createLinearGradient(0, h, 0, 0);
+  grad.addColorStop(0, '#5b7fe0');
+  grad.addColorStop(1, '#a5c8ff');
+
+  const bw = w / bars.length;
+  bars.forEach((db, i) => {
+    const norm = Math.max(0, Math.min(1, (db - floor) / (ceil - floor)));
+    const bh = norm * (h - 4);
+    specCtx.fillStyle = grad;
+    specCtx.fillRect(i * bw + 1, h - bh, bw - 2, bh);
+  });
+}
+
+function drawMeter(rmsDb, peakDb, holdDb) {
+  const w = meterCanvas.width, h = meterCanvas.height;
+  meterCtx.clearRect(0, 0, w, h);
+  const floor = -60, ceil = 0;
+  const toY = db => h - Math.max(0, Math.min(1, (db - floor) / (ceil - floor))) * h;
+
+  meterCtx.fillStyle = '#2a3140';
+  meterCtx.fillRect(0, 0, w, h);
+
+  [0, -6, -12, -20, -40, -60].forEach(db => {
+    const y = toY(db);
+    meterCtx.strokeStyle = db === 0 ? '#3a4252' : 'rgba(90,100,120,0.35)';
+    meterCtx.beginPath();
+    meterCtx.moveTo(0, y + 0.5);
+    meterCtx.lineTo(w, y + 0.5);
+    meterCtx.stroke();
+  });
+
+  const rmsY = toY(rmsDb);
+  const meterGrad = meterCtx.createLinearGradient(0, h, 0, 0);
+  meterGrad.addColorStop(0, '#59d69d');
+  meterGrad.addColorStop(0.75, '#59d69d');
+  meterGrad.addColorStop(1, '#ffcf5c');
+  meterCtx.fillStyle = meterGrad;
+  meterCtx.fillRect(4, rmsY, w - 8, h - rmsY);
+
+  const holdY = toY(holdDb);
+  meterCtx.fillStyle = '#ff5c5c';
+  meterCtx.fillRect(4, holdY - 2, w - 8, 2);
+
+  dbText.textContent = `rms ${rmsDb.toFixed(1)} dB · peak ${peakDb.toFixed(1)} dB · hold ${holdDb.toFixed(1)} dB`;
+}
+
+/* --- level history: scrolling strip chart of RMS / peak dB --- */
+const HISTORY_LEN = 300; /* ~30s at the server's ~10Hz push rate */
+const rmsHist = [];
+const peakHist = [];
+
+function drawHistory() {
+  const w = historyCanvas.width, h = historyCanvas.height;
+  historyCtx.clearRect(0, 0, w, h);
+
+  const floor = -60, ceil = 0;
+  const toY = db => h - Math.max(0, Math.min(1, (db - floor) / (ceil - floor))) * h;
+  const toX = i => (i / (HISTORY_LEN - 1)) * w;
+
+  drawHGrid(historyCtx, w, h, [0, -20, -40, -60].map(db => ({
+    y: toY(db), label: db, emphasis: db === 0,
+  })), db => `${db} dB`);
+
+  const plot = (arr, color) => {
+    if (arr.length < 2) return;
+    historyCtx.strokeStyle = color;
+    historyCtx.lineWidth = 1.5;
+    historyCtx.beginPath();
+    const offset = HISTORY_LEN - arr.length;
+    arr.forEach((db, i) => {
+      const x = toX(offset + i);
+      const y = toY(db);
+      i === 0 ? historyCtx.moveTo(x, y) : historyCtx.lineTo(x, y);
+    });
+    historyCtx.stroke();
+  };
+
+  plot(peakHist, '#ff5c5c');
+  plot(rmsHist, '#59d69d');
+}
+
+function pushHistory(rmsDb, peakDb) {
+  rmsHist.push(rmsDb);
+  peakHist.push(peakDb);
+  if (rmsHist.length > HISTORY_LEN) rmsHist.shift();
+  if (peakHist.length > HISTORY_LEN) peakHist.shift();
+}
+
+const es = new EventSource('/stream');
+es.onopen = () => statusEl.textContent = 'connected';
+es.onerror = () => statusEl.textContent = 'disconnected — retrying…';
+es.onmessage = (ev) => {
+  const d = JSON.parse(ev.data);
+  drawWave(d.wave);
+  drawSpec(d.spec);
+  drawMeter(d.rms_db, d.peak_db, d.peak_hold_db);
+  pushHistory(d.rms_db, d.peak_db);
+  drawHistory();
+};
+</script>
+</body>
+</html>
